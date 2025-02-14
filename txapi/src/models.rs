@@ -1,6 +1,15 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize, Debug)]
+#[serde(tag = "method")]
+pub enum Request {
+    #[serde(rename = "subscribe")]
+    Subscribe { params: SubscribeParams },
+    #[serde(rename = "unsubscribe")]
+    Unsubscribe { params: SubscribeParams },
+}
+
+#[derive(Deserialize, Serialize, Debug)]
 pub struct SubscribeReq {
     pub method: String,
     pub params: SubscribeParams,
@@ -13,12 +22,12 @@ pub struct SubscribeParams {
 
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(tag = "channel")]
-pub enum TxResponse {
+pub enum ChannelMsg {
     #[serde(rename = "transactions")]
     Transactions { data: Vec<Transaction> },
 
     #[serde(rename = "heartbeat")]
-    Heartbeat { data: HeartbeatData },
+    Heartbeat { data: Heartbeat },
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -38,6 +47,6 @@ pub struct Transaction {
 }
 
 #[derive(Deserialize, Serialize, Debug)]
-pub struct HeartbeatData {
+pub struct Heartbeat {
     pub status: String,
 }
