@@ -1,2 +1,2 @@
-# credit-card-transactions-api
-Mocked credit card transactions API for experimental purposes
+# credit-card-tx-api
+Mocked credit card transactions Websocket API for experimental/educational purposes
