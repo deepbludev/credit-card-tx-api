@@ -6,11 +6,15 @@ pub enum Request {
     #[serde(rename = "subscribe")]
     Subscribe { params: SubscribeParams },
     #[serde(rename = "unsubscribe")]
-    Unsubscribe { params: SubscribeParams },
+    Unsubscribe { params: UnsubscribeParams },
 }
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct SubscribeParams {
+    pub channel: String,
+}
+#[derive(Deserialize, Serialize, Debug)]
+pub struct UnsubscribeParams {
     pub channel: String,
 }
 

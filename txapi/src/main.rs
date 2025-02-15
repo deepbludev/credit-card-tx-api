@@ -10,7 +10,10 @@ use axum::{
 use futures::{
     sink::SinkExt,
     stream::{SplitSink, SplitStream, StreamExt},
+    Stream,
 };
+use std::pin::Pin;
+use std::time::Duration;
 use txapi::models::{ChannelMsg, Heartbeat, Request, Transaction};
 
 #[derive(Clone)]
@@ -73,21 +76,34 @@ async fn write(
     mut sender: SplitSink<WebSocket, Message>,
     mut rx: tokio::sync::mpsc::Receiver<Request>,
 ) {
-    let mut subscribed_channels: Vec<String> = Vec::new();
-    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+    let mut subscriptions: Vec<String> = Vec::new();
+    let mut tx_stream: Option<Pin<Box<dyn Stream<Item = Transaction> + Send>>> = None;
 
     loop {
         tokio::select! {
             Some(request) = rx.recv() => {
                 match request {
+                    // handle subscribe
                     Request::Subscribe { params } => {
-                        if !subscribed_channels.contains(&params.channel) {
-                            subscribed_channels.push(params.channel.clone());
+                        if !subscriptions.contains(&params.channel) {
+                            subscriptions.push(params.channel.clone());
+
+                            match params.channel.as_str() {
+                                "transactions" => {
+                                    // start a stream for the channel
+                                    tx_stream = Some(stream_transactions());
+                                }
+                                "heartbeat" => {
+                                    // nothing to do here
+                                }
+                                _ => {}
+                            }
                         }
+                        // send ack
                         let status = format!("Successfully subscribed to {} channel", params.channel);
                         let ack = ChannelMsg::Heartbeat {
                             data: Heartbeat {
-                                status,
+                                status
                             },
                         };
                         if let Ok(serialized) = serde_json::to_string(&ack) {
@@ -96,8 +112,21 @@ async fn write(
                             }
                         }
                     }
+
+                    // handle unsubscribe
                     Request::Unsubscribe { params } => {
-                        subscribed_channels.retain(|c| c != &params.channel);
+                        subscriptions.retain(|c| c != &params.channel);
+                        match params.channel.as_str() {
+                            "transactions" => {
+                                // stop the stream
+                                tx_stream = None;
+                            }
+                            "heartbeat" => {
+                                // nothing to do here
+                            }
+                            _ => {}
+                        }
+
                         let status = format!("Successfully unsubscribed from {} channel", params.channel);
                         let ack = ChannelMsg::Heartbeat {
                             data: Heartbeat {
@@ -113,31 +142,46 @@ async fn write(
                 }
             }
 
-            _ = interval.tick() => {
-                if subscribed_channels.contains(&"transactions".to_string()) {
-                    let transaction = Transaction {
-                        id: uuid::Uuid::new_v4().to_string().replace("-", ""),
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        cc_number: "4473593503484549".to_string(),
-                        category: "Grocery".to_string(),
-                        amount_usd_cents: rand::random::<u64>() % 10000,
-                        latitude: 37.774929,
-                        longitude: -122.419418,
-                        country_iso: "US".to_string(),
-                        city: "San Francisco".to_string(),
-                    };
-
-                    let msg = ChannelMsg::Transactions {
-                        data: vec![transaction],
-                    };
-
-                    if let Ok(serialized) = serde_json::to_string(&msg) {
-                        if sender.send(Message::Text(serialized.into())).await.is_err() {
-                            break;
-                        }
+            Some(transaction) = async {
+                match &mut tx_stream {
+                    Some(stream) => stream.next().await,
+                    None => None,
+                }
+            } => {
+                let msg = ChannelMsg::Transactions {
+                    data: vec![transaction],
+                };
+                println!("Sending transactions: {:?}", msg);
+                if let Ok(serialized) = serde_json::to_string(&msg) {
+                    if sender.send(Message::Text(serialized.into())).await.is_err() {
+                        break;
                     }
                 }
             }
+
+
         }
     }
+}
+
+// A stream that generates transactions
+fn stream_transactions() -> Pin<Box<dyn Stream<Item = Transaction> + Send>> {
+    let stream = futures::stream::unfold((), |()| async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let transaction = Transaction {
+            id: uuid::Uuid::new_v4().to_string().replace("-", ""),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            cc_number: "4473593503484549".to_string(),
+            category: "Grocery".to_string(),
+            amount_usd_cents: rand::random::<u64>() % 10000,
+            latitude: 37.774929,
+            longitude: -122.419418,
+            country_iso: "US".to_string(),
+            city: "San Francisco".to_string(),
+        };
+        Some((transaction, ()))
+    });
+
+    Box::pin(stream)
 }
