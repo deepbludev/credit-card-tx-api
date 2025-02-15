@@ -20,7 +20,6 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
-    // create a channel for broadcasting messages that holds 16 messages in the buffer.
     let app_state = AppState {};
 
     let app = Router::new()
