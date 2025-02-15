@@ -26,7 +26,7 @@ To subscribe to a channel, you need to send a message to the server with the fol
 {
   "method": "subscribe",
   "params": {
-    "channel": "trade"
+    "channel": "transactions"
   }
 }
 ```
