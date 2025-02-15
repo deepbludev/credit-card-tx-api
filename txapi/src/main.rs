@@ -9,21 +9,23 @@ use axum::{
 };
 use futures::{
     sink::SinkExt,
-    stream::{SplitSink, SplitStream, StreamExt},
+    stream::{select_all, SplitSink, SplitStream, StreamExt},
     Stream,
 };
-use std::pin::Pin;
 use std::time::Duration;
-use txapi::models::{ChannelMsg, Heartbeat, Request, Transaction};
+use tokio::sync::broadcast;
+use txapi::models::{ChannelMsg, Heartbeat, Transaction, WsMessage};
 
 #[derive(Clone)]
 struct AppState {
-    // nothing for now...
+    broadcaster_tx: broadcast::Sender<Transaction>,
 }
 
 #[tokio::main]
 async fn main() {
-    let app_state = AppState {};
+    let app_state = AppState {
+        broadcaster_tx: init_broadcaster().await,
+    };
 
     let app = Router::new()
         .route("/v1", get(websocket_handler))
@@ -44,14 +46,14 @@ async fn websocket_handler(
     ws.on_upgrade(|socket| websocket(socket, state))
 }
 
-async fn websocket(socket: WebSocket, _state: AppState) {
-    let (sender, receiver) = socket.split();
+async fn websocket(socket: WebSocket, state: AppState) {
+    let (ws_sink, ws_stream) = socket.split();
 
-    // Update channel type to use Request directly
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    // channel for messages between the websocket and the server
+    let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(1);
 
-    let write_task = tokio::spawn(write(sender, rx));
-    let read_task = tokio::spawn(read(receiver, tx));
+    let write_task = tokio::spawn(write(ws_sink, msg_rx, state));
+    let read_task = tokio::spawn(read(ws_stream, msg_tx));
 
     tokio::select! {
         _ = write_task => {},
@@ -59,39 +61,77 @@ async fn websocket(socket: WebSocket, _state: AppState) {
     }
 }
 
-async fn read(mut receiver: SplitStream<WebSocket>, tx: tokio::sync::mpsc::Sender<Request>) {
-    while let Some(Ok(msg)) = receiver.next().await {
+async fn init_broadcaster() -> broadcast::Sender<Transaction> {
+    let buffer_size = 100;
+    let buffer_size = std::env::var("BROADCAST_BUFFER_SIZE")
+        .map(|s| s.parse::<usize>().unwrap_or(buffer_size))
+        .unwrap_or(buffer_size);
+
+    let (broadcaster_tx, _) = broadcast::channel(buffer_size);
+    let broadcaster_tx_clone = broadcaster_tx.clone();
+
+    let mock_tx_stream = stream_tx_from_mocks();
+    // add more streams here (ex. kafka, mongodb, etc.)
+
+    // combine all streams into one
+    let mut broadcast_stream = select_all(vec![
+        Box::pin(mock_tx_stream),
+        // add other streams here...
+    ]);
+
+    // apawn the transaction stream processor
+    tokio::spawn(async move {
+        while let Some(transaction) = broadcast_stream.next().await {
+            // ignore send errors (occurs when no receivers)
+            // TODO: handle this gracefully
+            let _ = broadcaster_tx_clone.send(transaction);
+        }
+    });
+    broadcaster_tx
+}
+
+async fn read(mut ws_stream: SplitStream<WebSocket>, msg_tx: tokio::sync::mpsc::Sender<WsMessage>) {
+    while let Some(Ok(msg)) = ws_stream.next().await {
         if let Message::Text(text) = msg {
             println!("Received: {}", text);
-            if let Ok(request) = serde_json::from_str::<Request>(&text) {
-                let _ = tx.send(request).await;
-            } else {
-                println!("Failed to parse message: {}", text);
+
+            match serde_json::from_str::<WsMessage>(&text) {
+                Ok(request) => {
+                    let _ = msg_tx.send(request).await;
+                }
+                Err(_) => {
+                    println!("Failed to parse message: {}", text);
+                }
             }
         }
     }
 }
 
 async fn write(
-    mut sender: SplitSink<WebSocket, Message>,
-    mut rx: tokio::sync::mpsc::Receiver<Request>,
+    mut ws_sink: SplitSink<WebSocket, Message>,
+    mut msg_rx: tokio::sync::mpsc::Receiver<WsMessage>,
+    state: AppState,
 ) {
+    // store the channel subscriptions in-memory
     let mut subscriptions: Vec<String> = Vec::new();
-    let mut tx_stream: Option<Pin<Box<dyn Stream<Item = Transaction> + Send>>> = None;
+
+    // receiver for the transaction stream
+    let mut transaction_rx: Option<broadcast::Receiver<Transaction>> = None;
 
     loop {
         tokio::select! {
-            Some(request) = rx.recv() => {
+            // handle incoming messages
+            Some(request) = msg_rx.recv() => {
                 match request {
-                    // handle subscribe
-                    Request::Subscribe { params } => {
+                    // subscribe to a channel
+                    WsMessage::Subscribe { params } => {
                         if !subscriptions.contains(&params.channel) {
                             subscriptions.push(params.channel.clone());
 
                             match params.channel.as_str() {
                                 "transactions" => {
-                                    // start a stream for the channel
-                                    tx_stream = Some(stream_transactions());
+                                    // subscribe to the broadcast channel
+                                    transaction_rx = Some(state.broadcaster_tx.subscribe());
                                 }
                                 "heartbeat" => {
                                     // nothing to do here
@@ -100,26 +140,25 @@ async fn write(
                             }
                         }
                         // send ack
-                        let status = format!("Successfully subscribed to {} channel", params.channel);
-                        let ack = ChannelMsg::Heartbeat {
-                            data: Heartbeat {
-                                status
-                            },
-                        };
+                        let heartbeat = Heartbeat { status:format!("Successfully subscribed to {} channel", params.channel) };
+                        let ack = ChannelMsg::Heartbeat { data: heartbeat };
+
+                        // send the ack message to the client
                         if let Ok(serialized) = serde_json::to_string(&ack) {
-                            if sender.send(Message::Text(serialized.into())).await.is_err() {
+                            let msg = Message::Text(serialized.into());
+                            if ws_sink.send(msg).await.is_err() {
                                 break;
                             }
                         }
                     }
 
-                    // handle unsubscribe
-                    Request::Unsubscribe { params } => {
+                    // unsubscribe from a channel
+                    WsMessage::Unsubscribe { params } => {
                         subscriptions.retain(|c| c != &params.channel);
                         match params.channel.as_str() {
                             "transactions" => {
-                                // stop the stream
-                                tx_stream = None;
+                                // unsubscribe from the broadcast channel
+                                transaction_rx = None;
                             }
                             "heartbeat" => {
                                 // nothing to do here
@@ -127,14 +166,12 @@ async fn write(
                             _ => {}
                         }
 
-                        let status = format!("Successfully unsubscribed from {} channel", params.channel);
-                        let ack = ChannelMsg::Heartbeat {
-                            data: Heartbeat {
-                                status,
-                            },
-                        };
+                        let heartbeat = Heartbeat { status:format!("Successfully unsubscribed from {} channel", params.channel) };
+                        let ack = ChannelMsg::Heartbeat { data: heartbeat };
+
                         if let Ok(serialized) = serde_json::to_string(&ack) {
-                            if sender.send(Message::Text(serialized.into())).await.is_err() {
+                            let msg = Message::Text(serialized.into());
+                            if ws_sink.send(msg).await.is_err() {
                                 break;
                             }
                         }
@@ -142,30 +179,28 @@ async fn write(
                 }
             }
 
-            Some(transaction) = async {
-                match &mut tx_stream {
-                    Some(stream) => stream.next().await,
-                    None => None,
+            result = async {
+                match transaction_rx.as_mut() {
+                    Some(rx) => rx.recv().await.ok(),
+                    None => None
                 }
             } => {
-                let msg = ChannelMsg::Transactions {
-                    data: vec![transaction],
-                };
-                println!("Sending transactions: {:?}", msg);
-                if let Ok(serialized) = serde_json::to_string(&msg) {
-                    if sender.send(Message::Text(serialized.into())).await.is_err() {
-                        break;
+                if let Some(transaction) = result {
+                    let msg = ChannelMsg::Transactions { data: vec![transaction] };
+                    if let Ok(serialized) = serde_json::to_string(&msg) {
+                        let msg = Message::Text(serialized.into());
+                        if ws_sink.send(msg).await.is_err() {
+                            break;
+                        }
                     }
                 }
             }
-
-
         }
     }
 }
 
-// A stream that generates transactions
-fn stream_transactions() -> Pin<Box<dyn Stream<Item = Transaction> + Send>> {
+/// A stream that generates mock transactions
+fn stream_tx_from_mocks() -> impl Stream<Item = Transaction> + Send {
     let stream = futures::stream::unfold((), |()| async {
         tokio::time::sleep(Duration::from_millis(100)).await;
 

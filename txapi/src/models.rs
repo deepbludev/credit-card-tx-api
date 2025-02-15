@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(tag = "method")]
-pub enum Request {
+pub enum WsMessage {
     #[serde(rename = "subscribe")]
     Subscribe { params: SubscribeParams },
     #[serde(rename = "unsubscribe")]
@@ -28,7 +28,7 @@ pub enum ChannelMsg {
     Heartbeat { data: Heartbeat },
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Transaction {
     pub id: String,
     pub timestamp: String,
