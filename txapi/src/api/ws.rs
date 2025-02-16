@@ -62,10 +62,30 @@ mod models {
 /// which handles the subscription and unsubscription to channels.
 ///
 mod client {
+    use std::collections::HashSet;
+
     use crate::core::prelude::*;
     use crate::domain::prelude::*;
 
     use tokio::sync::broadcast;
+
+    #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+    pub enum Channel {
+        Transactions,
+        Heartbeat,
+    }
+
+    impl std::str::FromStr for Channel {
+        type Err = ();
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            match s {
+                "transactions" => Ok(Self::Transactions),
+                "heartbeat" => Ok(Self::Heartbeat),
+                _ => Err(()),
+            }
+        }
+    }
 
     /// The websocket client struct.
     ///
@@ -74,7 +94,7 @@ mod client {
     ///
     #[derive(Debug)]
     pub struct WsClient {
-        pub channels: Vec<String>,
+        pub channels: HashSet<Channel>,
         pub transaction_rx: Option<broadcast::Receiver<Transaction>>,
     }
 
@@ -83,7 +103,7 @@ mod client {
         ///
         pub fn new() -> Self {
             Self {
-                channels: vec![],
+                channels: HashSet::new(),
                 transaction_rx: None,
             }
         }
@@ -99,33 +119,25 @@ mod client {
         /// * `app_state` - The application state to get the channel senders from.
         ///
         ///
-        pub fn subscribe(&mut self, channel: impl Into<String>, app_state: &AppState) -> &Self {
-            let channel = channel.into();
-            if !self.channels.contains(&channel) {
-                self.channels.push(channel.clone());
-            }
-            match channel.as_str() {
-                "transactions" => {
+        pub fn subscribe(&mut self, channel: Channel, app_state: &AppState) -> &Self {
+            self.channels.insert(channel.clone());
+
+            match channel {
+                Channel::Transactions => {
                     self.transaction_rx = Some(app_state.transactions_tx.subscribe());
                 }
-                "heartbeat" => {
-                    // nothing to do here
-                }
-                _ => {}
-            }
+                Channel::Heartbeat => {}
+            };
             self
         }
-        pub fn unsubscribe(&mut self, channel: String) -> &Self {
-            self.channels.retain(|c| c != &channel);
-            match channel.as_str() {
-                "transactions" => {
+        pub fn unsubscribe(&mut self, channel: Channel) -> &Self {
+            self.channels.remove(&channel);
+            match channel {
+                Channel::Transactions => {
                     self.transaction_rx = None;
                 }
-                "heartbeat" => {
-                    // nothing to do here
-                }
-                _ => {}
-            }
+                Channel::Heartbeat => {}
+            };
             self
         }
     }
@@ -238,18 +250,25 @@ async fn write(
         state: &AppState,
     ) -> ChannelMsg {
         // handle the incoming message
+
         let status = match msg {
             // subscribe to a channel
-            WsMessage::Subscribe { params } => {
-                client.subscribe(&params.channel, state);
-                format!("Successfully subscribed to {} channel", params.channel)
-            }
+            WsMessage::Subscribe { params } => match params.channel.parse().ok() {
+                None => format!("Invalid channel: {}", params.channel),
+                Some(channel) => {
+                    client.subscribe(channel, state);
+                    format!("Successfully subscribed to {} channel", params.channel)
+                }
+            },
 
             // unsubscribe from a channel
-            WsMessage::Unsubscribe { params } => {
-                client.unsubscribe(params.channel.clone());
-                format!("Successfully unsubscribed from {} channel", params.channel)
-            }
+            WsMessage::Unsubscribe { params } => match params.channel.parse().ok() {
+                None => format!("Invalid channel: {}", params.channel),
+                Some(channel) => {
+                    client.unsubscribe(channel);
+                    format!("Successfully unsubscribed from {} channel", params.channel)
+                }
+            },
         };
 
         // send the status back to the client
