@@ -62,11 +62,9 @@ mod models {
 /// which handles the subscription and unsubscription to channels.
 ///
 mod client {
-    use std::collections::HashSet;
-
     use crate::core::prelude::*;
     use crate::domain::prelude::*;
-
+    use std::collections::HashSet;
     use tokio::sync::broadcast;
 
     #[derive(Debug, PartialEq, Eq, Hash, Clone)]
@@ -122,6 +120,7 @@ mod client {
         pub fn subscribe(&mut self, channel: Channel, app_state: &AppState) -> &Self {
             self.channels.insert(channel.clone());
 
+            // subscribe to the channel streams
             match channel {
                 Channel::Transactions => {
                     self.transaction_rx = Some(app_state.transactions_tx.subscribe());
@@ -132,6 +131,8 @@ mod client {
         }
         pub fn unsubscribe(&mut self, channel: Channel) -> &Self {
             self.channels.remove(&channel);
+
+            // unsubscribe from the channel streams
             match channel {
                 Channel::Transactions => {
                     self.transaction_rx = None;
