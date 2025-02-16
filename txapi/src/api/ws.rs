@@ -67,6 +67,11 @@ mod client {
     use std::collections::HashSet;
     use tokio::sync::broadcast;
 
+    /// Channel enum for the websocket client.
+    ///
+    /// This enum contains the available channels for the websocket client, such as
+    /// the transactions channel.
+    ///
     #[derive(Debug, PartialEq, Eq, Hash, Clone)]
     pub enum Channel {
         Transactions,
@@ -251,7 +256,6 @@ async fn write(
         state: &AppState,
     ) -> ChannelMsg {
         // handle the incoming message
-
         let status = match msg {
             // subscribe to a channel
             WsMessage::Subscribe { params } => match params.channel.parse().ok() {
