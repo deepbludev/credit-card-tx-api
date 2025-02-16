@@ -1,5 +1,4 @@
 use crate::core::prelude::*;
-use crate::domain::prelude::*;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -9,15 +8,18 @@ use axum::{
 };
 use futures::{
     sink::SinkExt,
-    stream::{select_all, SplitSink, SplitStream, StreamExt},
-    Stream,
+    stream::{SplitSink, SplitStream, StreamExt},
 };
 use models::{ChannelMsg, Heartbeat, WsMessage};
-use std::time::Duration;
 use tokio::sync::broadcast;
 
+/// Module for models for the websocket API.
+///
+/// This module includes the message types for the websocket API such as
+/// subscribe, unsubscribe, and heartbeat messages.
+///
 mod models {
-    use super::*;
+    use crate::domain::prelude::*;
     use serde::{Deserialize, Serialize};
 
     #[derive(Deserialize, Serialize, Debug)]
@@ -42,7 +44,7 @@ mod models {
     #[serde(tag = "channel")]
     pub enum ChannelMsg {
         #[serde(rename = "transactions")]
-        Transactions { data: Vec<Tx> },
+        Transactions { data: Vec<Transaction> },
 
         #[serde(rename = "heartbeat")]
         Heartbeat { data: Heartbeat },
@@ -54,189 +56,245 @@ mod models {
     }
 }
 
-pub async fn websocket_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
-    ws.on_upgrade(|socket| websocket(socket, state))
-}
+/// Module for the websocket client.
+///
+/// This module includes the client struct and methods for the websocket client
+/// which handles the subscription and unsubscription to channels.
+///
+mod client {
+    use crate::core::prelude::*;
+    use crate::domain::prelude::*;
 
-pub async fn websocket(socket: WebSocket, state: AppState) {
-    let (ws_sink, ws_stream) = socket.split();
+    use tokio::sync::broadcast;
 
-    // channel for messages between the websocket and the server
-    let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(1);
+    /// The websocket client struct.
+    ///
+    /// This struct handles the subscription and unsubscription to channels
+    /// for a given websocket connection.
+    ///
+    #[derive(Debug)]
+    pub struct WsClient {
+        pub channels: Vec<String>,
+        pub transaction_rx: Option<broadcast::Receiver<Transaction>>,
+    }
 
-    let write_task = tokio::spawn(write(ws_sink, msg_rx, state));
-    let read_task = tokio::spawn(read(ws_stream, msg_tx));
+    impl WsClient {
+        /// Creates a new websocket client with no channel subscriptions.
+        ///
+        pub fn new() -> Self {
+            Self {
+                channels: vec![],
+                transaction_rx: None,
+            }
+        }
 
-    tokio::select! {
-        _ = write_task => {},
-        _ = read_task => {},
+        /// Subscribes to a websocket channel.
+        ///
+        /// This functions updates the list of subscribed channels and the receiver
+        /// for the transactions channel.
+        ///
+        /// # Arguments
+        ///
+        /// * `channel` - The channel to subscribe to (ex. "transactions")
+        /// * `app_state` - The application state to get the channel senders from.
+        ///
+        ///
+        pub fn subscribe(&mut self, channel: impl Into<String>, app_state: &AppState) -> &Self {
+            let channel = channel.into();
+            if !self.channels.contains(&channel) {
+                self.channels.push(channel.clone());
+            }
+            match channel.as_str() {
+                "transactions" => {
+                    self.transaction_rx = Some(app_state.transactions_tx.subscribe());
+                }
+                "heartbeat" => {
+                    // nothing to do here
+                }
+                _ => {}
+            }
+            self
+        }
+        pub fn unsubscribe(&mut self, channel: String) -> &Self {
+            self.channels.retain(|c| c != &channel);
+            match channel.as_str() {
+                "transactions" => {
+                    self.transaction_rx = None;
+                }
+                "heartbeat" => {
+                    // nothing to do here
+                }
+                _ => {}
+            }
+            self
+        }
     }
 }
 
-pub async fn init_broadcaster() -> broadcast::Sender<Tx> {
-    let buffer_size = 100;
-    let buffer_size = std::env::var("BROADCAST_BUFFER_SIZE")
-        .map(|s| s.parse::<usize>().unwrap_or(buffer_size))
-        .unwrap_or(buffer_size);
+/// The endpoint for the websocket API.
+///
+/// This function upgrades the websocket connection and handles the incoming
+/// messages.
+///
+pub async fn endpoint(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    /// Handles the incoming messages from the websocket.
+    ///
+    /// This function splits the websocket into a sink and stream, and then
+    /// creates a channel for messages between the websocket and the server.
+    ///
+    /// It then spawns two tasks to handle the reading and writing of messages.
+    async fn handle(socket: WebSocket, state: AppState) {
+        let (ws_sink, ws_stream) = socket.split();
 
-    let (broadcaster_tx, _) = broadcast::channel(buffer_size);
-    let broadcaster_tx_clone = broadcaster_tx.clone();
+        // channel for messages between the websocket and the server
+        let (ws_tx, ws_rx) = tokio::sync::mpsc::channel(1);
 
-    let mock_tx_stream = stream_tx_from_mocks();
-    // add more streams here (ex. kafka, mongodb, etc.)
+        let write_task = tokio::spawn(write(ws_sink, ws_rx, state));
+        let read_task = tokio::spawn(read(ws_stream, ws_tx));
 
-    // combine all streams into one
-    let mut broadcast_stream = select_all(vec![
-        Box::pin(mock_tx_stream),
-        // add other streams here...
-    ]);
-
-    // apawn the transaction stream processor
-    tokio::spawn(async move {
-        while let Some(transaction) = broadcast_stream.next().await {
-            // ignore send errors (occurs when no receivers)
-            // TODO: handle this gracefully
-            let _ = broadcaster_tx_clone.send(transaction);
+        tokio::select! {
+            _ = write_task => {},
+            _ = read_task => {},
         }
-    });
-    broadcaster_tx
+    }
+
+    // upgrade the websocket connection using the ws handler
+    ws.on_upgrade(|socket| handle(socket, state))
 }
 
-pub async fn read(
-    mut ws_stream: SplitStream<WebSocket>,
-    msg_tx: tokio::sync::mpsc::Sender<WsMessage>,
-) {
+/// Read side of the websocket connection.
+///
+/// This function reads messages from the websocket and sends them to the server
+/// in a loop using the given mpsc channel sender.
+///
+/// # Arguments
+///
+/// * `ws_stream` - The websocket stream to read messages from.
+/// * `ws_tx` - The mpsc channel sender to send messages to the server.
+///
+async fn read(mut ws_stream: SplitStream<WebSocket>, ws_tx: tokio::sync::mpsc::Sender<WsMessage>) {
     while let Some(Ok(msg)) = ws_stream.next().await {
         if let Message::Text(text) = msg {
-            println!("Received: {}", text);
+            // TODO: add proper logging / tracing
 
             match serde_json::from_str::<WsMessage>(&text) {
                 Ok(request) => {
-                    let _ = msg_tx.send(request).await;
+                    let _ = ws_tx.send(request).await;
                 }
                 Err(_) => {
-                    println!("Failed to parse message: {}", text);
+                    // TODO: handle this gracefully
                 }
             }
         }
     }
 }
 
-pub async fn write(
+/// Write side of the websocket connection.
+///
+/// This function handles the writing of messages to the websocket. It also
+/// sends transactions from the transactions channel to the websocket.
+///
+/// # Arguments
+///
+/// * `ws_sink` - The websocket sink to write messages to.
+/// * `ws_rx` - The mpsc channel receiver to receive messages from the websocket.
+/// * `state` - The application state to get the channel senders from.
+///
+async fn write(
     mut ws_sink: SplitSink<WebSocket, Message>,
-    mut msg_rx: tokio::sync::mpsc::Receiver<WsMessage>,
+    mut ws_rx: tokio::sync::mpsc::Receiver<WsMessage>,
     state: AppState,
 ) {
-    // store the channel subscriptions in-memory
-    let mut subscriptions: Vec<String> = Vec::new();
-
-    // receiver for the transaction stream
-    let mut transaction_rx: Option<broadcast::Receiver<Tx>> = None;
+    let mut client = client::WsClient::new();
 
     loop {
+        // branch out the incoming message handling and message sending concurrently
         tokio::select! {
-            // handle incoming messages
-            Some(request) = msg_rx.recv() => {
-                match request {
-                    // subscribe to a channel
-                    WsMessage::Subscribe { params } => {
-                        if !subscriptions.contains(&params.channel) {
-                            subscriptions.push(params.channel.clone());
-
-                            match params.channel.as_str() {
-                                "transactions" => {
-                                    // subscribe to the broadcast channel
-                                    transaction_rx = Some(state.broadcaster_tx.subscribe());
-                                }
-                                "heartbeat" => {
-                                    // nothing to do here
-                                }
-                                _ => {}
-                            }
-                        }
-                        // send ack
-                        let heartbeat = Heartbeat { status:format!("Successfully subscribed to {} channel", params.channel) };
-                        let ack = ChannelMsg::Heartbeat { data: heartbeat };
-
-                        // send the ack message to the client
-                        if let Ok(serialized) = serde_json::to_string(&ack) {
-                            let msg = Message::Text(serialized.into());
-                            if ws_sink.send(msg).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-
-                    // unsubscribe from a channel
-                    WsMessage::Unsubscribe { params } => {
-                        subscriptions.retain(|c| c != &params.channel);
-                        match params.channel.as_str() {
-                            "transactions" => {
-                                // unsubscribe from the broadcast channel
-                                transaction_rx = None;
-                            }
-                            "heartbeat" => {
-                                // nothing to do here
-                            }
-                            _ => {}
-                        }
-
-                        let heartbeat = Heartbeat { status:format!("Successfully unsubscribed from {} channel", params.channel) };
-                        let ack = ChannelMsg::Heartbeat { data: heartbeat };
-
-                        if let Ok(serialized) = serde_json::to_string(&ack) {
-                            let msg = Message::Text(serialized.into());
-                            if ws_sink.send(msg).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
+            // branch 1: handle incoming messages
+            Some(msg) = ws_rx.recv() => {
+                let response = handle_message(&msg, &mut client, &state).await;
+                send_message(&response, &mut ws_sink).await;
             }
 
-            // receive transactions from the broadcast channel
-            // and send them to the client
-            result = async {
-                match transaction_rx.as_mut() {
-                    Some(rx) => rx.recv().await.ok(),
-                    None => None
+            // branch 2: send transactions from the transactions channel
+            Some(transaction) = recv_from_channel(client.transaction_rx.as_mut()) => {
+                let transactions = vec![transaction];
+                let msg = ChannelMsg::Transactions { data: transactions };
+                send_message(&msg, &mut ws_sink).await;
+
+                // TODO: consider sending multiple transactions at once by batching
+            }
+        }
+    }
+
+    /// Handles the incoming messages from the websocket.
+    ///
+    /// This function handles the incoming messages from the websocket and
+    /// returns the appropriate response.
+    ///
+    async fn handle_message(
+        msg: &WsMessage,
+        client: &mut client::WsClient,
+        state: &AppState,
+    ) -> ChannelMsg {
+        // handle the incoming message
+        let status = match msg {
+            // subscribe to a channel
+            WsMessage::Subscribe { params } => {
+                client.subscribe(&params.channel, state);
+                format!("Successfully subscribed to {} channel", params.channel)
+            }
+
+            // unsubscribe from a channel
+            WsMessage::Unsubscribe { params } => {
+                client.unsubscribe(params.channel.clone());
+                format!("Successfully unsubscribed from {} channel", params.channel)
+            }
+        };
+
+        // send the status back to the client
+        ChannelMsg::Heartbeat {
+            data: Heartbeat { status },
+        }
+    }
+
+    /// Sends a message by serializing the message and sending it to the websocket.
+    ///
+    /// # Arguments
+    ///
+    /// * `msg` - The message to send to the websocket.
+    /// * `ws_sink` - The websocket sink to send the message to.
+    ///
+    async fn send_message(msg: &ChannelMsg, ws_sink: &mut SplitSink<WebSocket, Message>) {
+        if let Ok(serialized) = serde_json::to_string(&msg) {
+            match ws_sink.send(Message::Text(serialized.into())).await {
+                Ok(_) => {
+                    // TODO: add logging
                 }
-            } => {
-                if let Some(transaction) = result {
-                    let msg = ChannelMsg::Transactions { data: vec![transaction] };
-                    if let Ok(serialized) = serde_json::to_string(&msg) {
-                        let msg = Message::Text(serialized.into());
-                        if ws_sink.send(msg).await.is_err() {
-                            break;
-                        }
-                    }
+                Err(_) => {
+                    // TODO: handle this gracefully
                 }
             }
         }
     }
-}
 
-/// A stream that generates mock transactions
-pub fn stream_tx_from_mocks() -> impl Stream<Item = Tx> + Send {
-    let stream = futures::stream::unfold((), |()| async {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let transaction = Tx {
-            id: uuid::Uuid::new_v4().to_string().replace("-", ""),
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            cc_number: "4473593503484549".to_string(),
-            category: "Grocery".to_string(),
-            amount_usd_cents: rand::random::<u64>() % 10000,
-            latitude: 37.774929,
-            longitude: -122.419418,
-            country_iso: "US".to_string(),
-            city: "San Francisco".to_string(),
-        };
-        Some((transaction, ()))
-    });
-
-    Box::pin(stream)
+    /// Receives a message from a given channel stream, such as the transactions channel.
+    ///
+    /// # Arguments
+    ///
+    /// * `channel_rx` - The channel receiver to receive the message from.
+    ///
+    /// # Returns
+    ///
+    /// An `Option<T>` containing the received message if successful, or `None` if the channel is not subscribed
+    /// or if receiving fails.
+    async fn recv_from_channel<T: Clone>(
+        channel_rx: Option<&mut broadcast::Receiver<T>>,
+    ) -> Option<T> {
+        match channel_rx {
+            // receive transactions from the transactions channel if subscribed
+            Some(channel_rx) => channel_rx.recv().await.ok(),
+            None => None,
+        }
+    }
 }
