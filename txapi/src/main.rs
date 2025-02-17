@@ -7,7 +7,7 @@ use txapi::{api, core::prelude::*, stream};
 /// necessary dependencies into the AppState struct.
 ///
 async fn init_app_state() -> AppState {
-    let (transactions_tx, _) = stream::init_transactions_channel().await;
+    let (transactions_tx, _) = stream::transactions_channel().await;
 
     AppState { transactions_tx }
 }

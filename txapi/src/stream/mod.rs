@@ -14,7 +14,7 @@ use crate::domain::prelude::*;
 /// This initializer is meant to be used to create a broadcaster at App State level,
 /// in order to make it available to the websocket handler.
 ///
-pub async fn init_transactions_channel() -> (
+pub async fn transactions_channel() -> (
     broadcast::Sender<Transaction>,
     broadcast::Receiver<Transaction>,
 ) {

@@ -61,7 +61,7 @@ mod models {
 /// This module includes the client struct and methods for the websocket client
 /// which handles the subscription and unsubscription to channels.
 ///
-mod client {
+pub mod client {
     use crate::core::prelude::*;
     use crate::domain::prelude::*;
     use std::collections::HashSet;
@@ -95,22 +95,13 @@ mod client {
     /// This struct handles the subscription and unsubscription to channels
     /// for a given websocket connection.
     ///
-    #[derive(Debug)]
+    #[derive(Debug, Default)]
     pub struct WsClient {
         pub channels: HashSet<Channel>,
         pub transaction_rx: Option<broadcast::Receiver<Transaction>>,
     }
 
     impl WsClient {
-        /// Creates a new websocket client with no channel subscriptions.
-        ///
-        pub fn new() -> Self {
-            Self {
-                channels: HashSet::new(),
-                transaction_rx: None,
-            }
-        }
-
         /// Subscribes to a websocket channel.
         ///
         /// This functions updates the list of subscribed channels and the receiver
@@ -134,6 +125,12 @@ mod client {
             };
             self
         }
+
+        /// Unsubscribes from a websocket channel.
+        ///
+        /// This functions updates the list of subscribed channels and the receiver
+        /// for the transactions channel.
+        ///
         pub fn unsubscribe(&mut self, channel: Channel) -> &Self {
             self.channels.remove(&channel);
 
@@ -223,7 +220,7 @@ async fn write(
     mut ws_rx: tokio::sync::mpsc::Receiver<WsMessage>,
     state: AppState,
 ) {
-    let mut client = client::WsClient::new();
+    let mut client = client::WsClient::default();
 
     loop {
         // branch out the incoming message handling and message sending concurrently
