@@ -13,6 +13,7 @@ use futures::{
 use models::{ChannelMsg, WsMessage};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::{error, info};
 
 /// The endpoint for the websocket API.
 ///
@@ -62,9 +63,13 @@ pub async fn endpoint(ws: WebSocketUpgrade, State(state): State<AppState>) -> im
 async fn read(mut receiver: SplitStream<WebSocket>, client: Arc<RwLock<client::WsClient>>) {
     while let Some(Ok(msg)) = receiver.next().await {
         if let Message::Text(text) = msg {
-            let ws_msg = serde_json::from_str::<WsMessage>(&text).unwrap();
-            let mut client = client.write().await;
-            handle_incoming(&ws_msg, &mut client).await;
+            match serde_json::from_str::<WsMessage>(&text) {
+                Err(e) => error!("Invalid message: {}", e),
+                Ok(ws_msg) => {
+                    let mut client = client.write().await;
+                    handle_incoming(&ws_msg, &mut client).await;
+                }
+            }
         }
     }
 }
@@ -96,12 +101,10 @@ async fn write(
             // heartbeat channel - all clients
             heartbeat = heartbeat_rx.recv() => {
                 match heartbeat {
+                    Err(_) => error!("Error receiving heartbeat from channel"),
                     Ok(heartbeat) => {
                         let mut sender = sender.write().await;
                         send(&mut sender, ChannelMsg::Heartbeat { data: heartbeat }).await;
-                    }
-                    Err(_) => {
-                        // TODO: handle this gracefully
                     }
                 }
             }
@@ -109,15 +112,13 @@ async fn write(
             // transactions channel
             transaction = transactions_rx.recv() => {
                 match transaction {
+                    Err(_) => error!("Error receiving transaction from channel"),
                     Ok(transaction) => {
                         let client = client.read().await;
                         if client.is_subscribed(&Channel::Transactions) {
                             let mut sender = sender.write().await;
                             send(&mut sender, ChannelMsg::Transactions { data: vec![transaction] }).await;
                         }
-                    }
-                    Err(_) => {
-                        // TODO: handle this gracefully
                     }
                 }
             }
@@ -135,25 +136,19 @@ async fn handle_incoming(msg: &WsMessage, client: &mut client::WsClient) {
     match msg {
         // subscribe to a channel
         WsMessage::Subscribe { params } => match params.channel.parse() {
+            Err(e) => error!("Invalid channel: {}", e),
             Ok(channel) => {
                 client.subscribe(channel);
-                println!("Successfully subscribed to {} channel", params.channel)
-            }
-            Err(e) => {
-                println!("Invalid channel: {}", e)
-                // TODO: handle this gracefully
+                info!("Successfully subscribed to {} channel", params.channel)
             }
         },
 
         // unsubscribe from a channel
         WsMessage::Unsubscribe { params } => match params.channel.parse() {
+            Err(e) => error!("Invalid channel: {}", e),
             Ok(channel) => {
                 client.unsubscribe(channel);
-                println!("Successfully unsubscribed from {} channel", params.channel)
-            }
-            Err(e) => {
-                println!("Invalid channel: {}", e);
-                // TODO: handle this gracefully
+                info!("Successfully unsubscribed from {} channel", params.channel)
             }
         },
     };
@@ -169,14 +164,8 @@ async fn handle_incoming(msg: &WsMessage, client: &mut client::WsClient) {
 async fn send(tx: &mut SplitSink<WebSocket, Message>, msg: ChannelMsg) {
     if let Ok(serialized) = serde_json::to_string(&msg) {
         match tx.send(Message::Text(serialized.into())).await {
-            Ok(_) => {
-                // TODO: add proper logging
-                println!("sent message: {:?}", msg);
-            }
-            Err(e) => {
-                // TODO: handle this gracefully
-                println!("error sending message: {:?}", e);
-            }
+            Ok(_) => info!("sent message: {:?}", msg),
+            Err(e) => error!("error sending message: {:?}", e),
         }
     }
 }
