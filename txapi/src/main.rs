@@ -6,10 +6,17 @@ use txapi::{api, core::prelude::*, stream};
 /// This function initializes the application state by injecting all the
 /// necessary dependencies into the AppState struct.
 ///
+/// The main dependencies are the websocket channel senders, which are used to broadcast
+/// messages to the websocket clients.
+///
 async fn init_app_state() -> AppState {
-    let (transactions_tx, _) = stream::transactions_channel().await;
+    let (transactions_tx, _) = stream::transactions::channel().await;
+    let (heartbeat_tx, _) = stream::heartbeat::channel().await;
 
-    AppState { transactions_tx }
+    AppState {
+        heartbeat_tx,
+        transactions_tx,
+    }
 }
 
 #[tokio::main]

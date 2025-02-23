@@ -1,5 +1,5 @@
 pub mod prelude {
-    pub use super::transactions::Transaction;
+    pub use super::{heartbeat::Heartbeat, transactions::Transaction};
 }
 
 pub mod transactions {
@@ -38,5 +38,14 @@ pub mod transactions {
                 city: "San Francisco".to_string(),
             }
         }
+    }
+}
+
+pub mod heartbeat {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Deserialize, Serialize, Debug, Clone)]
+    pub struct Heartbeat {
+        pub status: String,
     }
 }

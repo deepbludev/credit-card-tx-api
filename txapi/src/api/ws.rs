@@ -10,9 +10,176 @@ use futures::{
     sink::SinkExt,
     stream::{SplitSink, SplitStream, StreamExt},
 };
-use models::{ChannelMsg, Heartbeat, WsMessage};
+use models::{ChannelMsg, WsMessage};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// The endpoint for the websocket API.
+///
+/// This function upgrades the websocket connection and handles the incoming
+/// messages.
+///
+pub async fn endpoint(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    /// Handles the incoming messages from the websocket.
+    ///
+    /// This function splits the websocket into a sink and stream, and then
+    /// creates a channel for messages between the websocket and the server.
+    ///
+    /// It then spawns two tasks to handle the reading and writing of messages.
+    ///
+    async fn handle(socket: WebSocket, state: AppState) {
+        let (sender, receiver) = socket.split();
+
+        let client = Arc::new(RwLock::new(client::WsClient::default()));
+        let sender = Arc::new(RwLock::new(sender));
+
+        let read_task = tokio::spawn(read(receiver, client.clone()));
+        let write_task = tokio::spawn(write(sender, client, state.clone()));
+
+        tokio::select! {
+            _ = read_task => {
+                // TODO: handle this gracefully
+            },
+            _ = write_task => {
+                // TODO: handle this gracefully
+            },
+        }
+    }
+    // upgrade the websocket connection using the ws handler
+    ws.on_upgrade(move |socket| handle(socket, state))
+}
+
+/// Read side of the websocket connection.
+///
+/// This function reads messages from the websocket and sends them to the server
+/// in a loop using the given mpsc channel sender.
+///
+/// # Arguments
+///
+/// * `ws_stream` - The websocket stream to read messages from.
+/// * `ws_tx` - The mpsc channel sender to send messages to the server.
+///
+async fn read(mut receiver: SplitStream<WebSocket>, client: Arc<RwLock<client::WsClient>>) {
+    while let Some(Ok(msg)) = receiver.next().await {
+        if let Message::Text(text) = msg {
+            let ws_msg = serde_json::from_str::<WsMessage>(&text).unwrap();
+            let mut client = client.write().await;
+            handle_incoming(&ws_msg, &mut client).await;
+        }
+    }
+}
+
+/// Write side of the websocket connection.
+///
+/// This function handles the writing of messages to the websocket. It also
+/// sends transactions from the transactions channel to the websocket.
+///
+/// # Arguments
+///
+/// * `ws_sink` - The websocket sink to write messages to.
+/// * `ws_rx` - The mpsc channel receiver to receive messages from the websocket.
+/// * `state` - The application state to get the channel senders from.
+///
+async fn write(
+    sender: Arc<RwLock<SplitSink<WebSocket, Message>>>,
+    client: Arc<RwLock<client::WsClient>>,
+    state: AppState,
+) {
+    use client::Channel;
+
+    // Create subscriptions for heartbeat and transactions channels.
+    let mut heartbeat_rx = state.heartbeat_tx.subscribe();
+    let mut transactions_rx = state.transactions_tx.subscribe();
+
+    loop {
+        tokio::select! {
+            // heartbeat channel - all clients
+            heartbeat = heartbeat_rx.recv() => {
+                match heartbeat {
+                    Ok(heartbeat) => {
+                        let mut sender = sender.write().await;
+                        send(&mut sender, ChannelMsg::Heartbeat { data: heartbeat }).await;
+                    }
+                    Err(_) => {
+                        // TODO: handle this gracefully
+                    }
+                }
+            }
+
+            // transactions channel
+            transaction = transactions_rx.recv() => {
+                match transaction {
+                    Ok(transaction) => {
+                        let client = client.read().await;
+                        if client.is_subscribed(&Channel::Transactions) {
+                            let mut sender = sender.write().await;
+                            send(&mut sender, ChannelMsg::Transactions { data: vec![transaction] }).await;
+                        }
+                    }
+                    Err(_) => {
+                        // TODO: handle this gracefully
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Handles the incoming messages from the websocket.
+///
+/// This function handles the incoming messages from the websocket and
+/// returns the appropriate response.
+///
+async fn handle_incoming(msg: &WsMessage, client: &mut client::WsClient) {
+    // handle the incoming message
+    match msg {
+        // subscribe to a channel
+        WsMessage::Subscribe { params } => match params.channel.parse() {
+            Ok(channel) => {
+                client.subscribe(channel);
+                println!("Successfully subscribed to {} channel", params.channel)
+            }
+            Err(e) => {
+                println!("Invalid channel: {}", e)
+                // TODO: handle this gracefully
+            }
+        },
+
+        // unsubscribe from a channel
+        WsMessage::Unsubscribe { params } => match params.channel.parse() {
+            Ok(channel) => {
+                client.unsubscribe(channel);
+                println!("Successfully unsubscribed from {} channel", params.channel)
+            }
+            Err(e) => {
+                println!("Invalid channel: {}", e);
+                // TODO: handle this gracefully
+            }
+        },
+    };
+}
+
+/// Sends a message by serializing the message and sending it to the websocket.
+///
+/// # Arguments
+///
+/// * `msg` - The message to send to the websocket.
+/// * `sender` - The websocket sender to send the message to.
+///
+async fn send(tx: &mut SplitSink<WebSocket, Message>, msg: ChannelMsg) {
+    if let Ok(serialized) = serde_json::to_string(&msg) {
+        match tx.send(Message::Text(serialized.into())).await {
+            Ok(_) => {
+                // TODO: add proper logging
+                println!("sent message: {:?}", msg);
+            }
+            Err(e) => {
+                // TODO: handle this gracefully
+                println!("error sending message: {:?}", e);
+            }
+        }
+    }
+}
 
 /// Module for models for the websocket API.
 ///
@@ -50,11 +217,6 @@ mod models {
         #[serde(rename = "heartbeat")]
         Heartbeat { data: Heartbeat },
     }
-
-    #[derive(Deserialize, Serialize, Debug)]
-    pub struct Heartbeat {
-        pub status: String,
-    }
 }
 
 /// Module for the websocket client.
@@ -72,18 +234,18 @@ pub mod client {
     ///
     #[derive(Debug, PartialEq, Eq, Hash, Clone)]
     pub enum Channel {
-        Transactions,
         Heartbeat,
+        Transactions,
     }
 
     impl std::str::FromStr for Channel {
-        type Err = ();
+        type Err = String;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
             match s {
-                "transactions" => Ok(Self::Transactions),
                 "heartbeat" => Ok(Self::Heartbeat),
-                _ => Err(()),
+                "transactions" => Ok(Self::Transactions),
+                _ => Err(format!("Invalid channel: {}", s)),
             }
         }
     }
@@ -104,12 +266,6 @@ pub mod client {
         /// This functions updates the list of subscribed channels and the receiver
         /// for the transactions channel.
         ///
-        /// # Arguments
-        ///
-        /// * `channel` - The channel to subscribe to (ex. "transactions")
-        /// * `app_state` - The application state to get the channel senders from.
-        ///
-        ///
         pub fn subscribe(&mut self, channel: Channel) -> &Self {
             self.channels.insert(channel.clone());
             self
@@ -122,139 +278,12 @@ pub mod client {
         ///
         pub fn unsubscribe(&mut self, channel: Channel) -> &Self {
             self.channels.remove(&channel);
-
             self
         }
-    }
-}
 
-/// The endpoint for the websocket API.
-///
-/// This function upgrades the websocket connection and handles the incoming
-/// messages.
-///
-pub async fn endpoint(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    /// Handles the incoming messages from the websocket.
-    ///
-    /// This function splits the websocket into a sink and stream, and then
-    /// creates a channel for messages between the websocket and the server.
-    ///
-    /// It then spawns two tasks to handle the reading and writing of messages.
-    ///
-    async fn handle(socket: WebSocket, state: AppState) {
-        let (sender, receiver) = socket.split();
-        let client = Arc::new(RwLock::new(client::WsClient::default()));
-
-        let read_task = tokio::spawn(read(receiver, client.clone()));
-        let write_task = tokio::spawn(write(sender, client, state.clone()));
-
-        tokio::select! {
-            _ = read_task => {},
-            _ = write_task => {},
-        }
-    }
-    // upgrade the websocket connection using the ws handler
-    ws.on_upgrade(move |socket| handle(socket, state))
-}
-
-/// Read side of the websocket connection.
-///
-/// This function reads messages from the websocket and sends them to the server
-/// in a loop using the given mpsc channel sender.
-///
-/// # Arguments
-///
-/// * `ws_stream` - The websocket stream to read messages from.
-/// * `ws_tx` - The mpsc channel sender to send messages to the server.
-///
-async fn read(mut receiver: SplitStream<WebSocket>, client: Arc<RwLock<client::WsClient>>) {
-    while let Some(Ok(msg)) = receiver.next().await {
-        if let Message::Text(text) = msg {
-            let ws_msg = serde_json::from_str::<WsMessage>(&text).unwrap();
-            let mut client = client.write().await;
-            handle_message(&ws_msg, &mut client).await;
-        }
-    }
-}
-
-/// Write side of the websocket connection.
-///
-/// This function handles the writing of messages to the websocket. It also
-/// sends transactions from the transactions channel to the websocket.
-///
-/// # Arguments
-///
-/// * `ws_sink` - The websocket sink to write messages to.
-/// * `ws_rx` - The mpsc channel receiver to receive messages from the websocket.
-/// * `state` - The application state to get the channel senders from.
-///
-async fn write(
-    mut sender: SplitSink<WebSocket, Message>,
-    client: Arc<RwLock<client::WsClient>>,
-    state: AppState,
-) {
-    let mut transactions_rx = state.transactions_tx.subscribe();
-
-    while let Ok(transaction) = transactions_rx.recv().await {
-        let client = client.read().await;
-        if client.channels.contains(&client::Channel::Transactions) {
-            let msg = ChannelMsg::Transactions {
-                data: vec![transaction],
-            };
-            send_message(&msg, &mut sender).await;
-        }
-    }
-}
-
-/// Handles the incoming messages from the websocket.
-///
-/// This function handles the incoming messages from the websocket and
-/// returns the appropriate response.
-///
-async fn handle_message(msg: &WsMessage, client: &mut client::WsClient) -> ChannelMsg {
-    // handle the incoming message
-    let status = match msg {
-        // subscribe to a channel
-        WsMessage::Subscribe { params } => match params.channel.parse().ok() {
-            None => format!("Invalid channel: {}", params.channel),
-            Some(channel) => {
-                client.subscribe(channel);
-                format!("Successfully subscribed to {} channel", params.channel)
-            }
-        },
-
-        // unsubscribe from a channel
-        WsMessage::Unsubscribe { params } => match params.channel.parse().ok() {
-            None => format!("Invalid channel: {}", params.channel),
-            Some(channel) => {
-                client.unsubscribe(channel);
-                format!("Successfully unsubscribed from {} channel", params.channel)
-            }
-        },
-    };
-
-    // send the status back to the client
-    ChannelMsg::Heartbeat {
-        data: Heartbeat { status },
-    }
-}
-
-/// Sends a message by serializing the message and sending it to the websocket.
-///
-/// # Arguments
-///
-/// * `msg` - The message to send to the websocket.
-/// * `sender` - The websocket sender to send the message to.
-///
-async fn send_message(msg: &ChannelMsg, sender: &mut SplitSink<WebSocket, Message>) {
-    if let Ok(serialized) = serde_json::to_string(&msg) {
-        match sender.send(Message::Text(serialized.into())).await {
-            Ok(_) => {
-                // TODO: add logging
-            }
-            Err(_) => {
-                // TODO: handle this gracefully
-            }
+        /// Checks if the client is subscribed to a given channel.
+        pub fn is_subscribed(&self, channel: &Channel) -> bool {
+            self.channels.contains(channel)
         }
     }
 }
