@@ -21,33 +21,44 @@ use tracing::{error, info};
 /// messages.
 ///
 pub async fn endpoint(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    /// Handles the incoming messages from the websocket.
-    ///
-    /// This function splits the websocket into a sink and stream, and then
-    /// creates a channel for messages between the websocket and the server.
-    ///
-    /// It then spawns two tasks to handle the reading and writing of messages.
-    ///
-    async fn handle(socket: WebSocket, state: AppState) {
-        let (sender, receiver) = socket.split();
-
-        let client = Arc::new(RwLock::new(client::WsClient::default()));
-        let sender = Arc::new(RwLock::new(sender));
-
-        let read_task = tokio::spawn(read(receiver, client.clone()));
-        let write_task = tokio::spawn(write(sender, client, state.clone()));
-
-        tokio::select! {
-            _ = read_task => {
-                // TODO: handle this gracefully
-            },
-            _ = write_task => {
-                // TODO: handle this gracefully
-            },
-        }
-    }
-    // upgrade the websocket connection using the ws handler
     ws.on_upgrade(move |socket| handle(socket, state))
+}
+
+/// Handles the incoming messages from the websocket.
+///
+/// This function splits the websocket into a sink and stream, and then
+/// creates a channel for messages between the websocket and the server.
+///
+/// It then spawns two tasks to handle the reading and writing of messages.
+///
+async fn handle(socket: WebSocket, state: AppState) {
+    let (sender, receiver) = socket.split();
+
+    let client = Arc::new(RwLock::new(client::WsClient::default()));
+    let sender = Arc::new(RwLock::new(sender));
+
+    let read_task = tokio::spawn(read(receiver, client.clone()));
+    let write_task = tokio::spawn(write(sender, client, state.clone()));
+
+    tokio::pin!(read_task);
+    tokio::pin!(write_task);
+
+    tokio::select! {
+        res = &mut read_task => {
+            write_task.abort();
+            match res {
+                Ok(_) => info!("read task completed successfully."),
+                Err(err) => error!("read task encountered an error: {:?}", err),
+            }
+        },
+        res = &mut write_task => {
+            read_task.abort();
+            match res {
+                Ok(_) => info!("write task completed successfully."),
+                Err(err) => error!("write task encountered an error: {:?}", err),
+            }
+        },
+    }
 }
 
 /// Read side of the websocket connection.
