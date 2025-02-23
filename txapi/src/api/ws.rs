@@ -12,7 +12,7 @@ use futures::{
 };
 use models::{ChannelMsg, WsMessage};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 use tracing::{error, info};
 
 /// The endpoint for the websocket API.
@@ -32,8 +32,8 @@ pub async fn endpoint(ws: WebSocketUpgrade, State(state): State<AppState>) -> im
 async fn handle(socket: WebSocket, state: AppState) {
     let (sender, receiver) = socket.split();
 
-    let client = Arc::new(RwLock::new(client::WsClient::default()));
-    let sender = Arc::new(RwLock::new(sender));
+    let client = Arc::new(Mutex::new(client::WsClient::default()));
+    let sender = Arc::new(Mutex::new(sender));
 
     let read_task = tokio::spawn(read(receiver, client.clone()));
     let write_task = tokio::spawn(write(sender, client, state.clone()));
@@ -63,13 +63,13 @@ async fn handle(socket: WebSocket, state: AppState) {
 ///
 /// This function reads messages from the websocket and handles
 /// the received messages.
-async fn read(mut receiver: SplitStream<WebSocket>, client: Arc<RwLock<client::WsClient>>) {
+async fn read(mut receiver: SplitStream<WebSocket>, client: Arc<Mutex<client::WsClient>>) {
     while let Some(Ok(msg)) = receiver.next().await {
         if let Message::Text(text) = msg {
             match serde_json::from_str::<WsMessage>(&text) {
                 Err(e) => error!("Invalid message: {}", e),
                 Ok(ws_msg) => {
-                    let mut client = client.write().await;
+                    let mut client = client.lock().await;
                     handle_incoming(&ws_msg, &mut client).await;
                 }
             }
@@ -82,8 +82,8 @@ async fn read(mut receiver: SplitStream<WebSocket>, client: Arc<RwLock<client::W
 /// This function handles the writing of messages to the websocket. It streams
 /// the data for each of the client's subscribed channels.
 async fn write(
-    sender: Arc<RwLock<SplitSink<WebSocket, Message>>>,
-    client: Arc<RwLock<client::WsClient>>,
+    sender: Arc<Mutex<SplitSink<WebSocket, Message>>>,
+    client: Arc<Mutex<client::WsClient>>,
     state: AppState,
 ) {
     use client::Channel;
@@ -99,7 +99,7 @@ async fn write(
                 match heartbeat {
                     Err(_) => error!("Error receiving heartbeat from channel"),
                     Ok(heartbeat) => {
-                        let mut sender = sender.write().await;
+                        let mut sender = sender.lock().await;
                         send(&mut sender, ChannelMsg::Heartbeat { data: heartbeat }).await;
                     }
                 }
@@ -110,9 +110,9 @@ async fn write(
                 match transaction {
                     Err(_) => error!("Error receiving transaction from channel"),
                     Ok(transaction) => {
-                        let client = client.read().await;
+                        let client = client.lock().await;
                         if client.is_subscribed(&Channel::Transactions) {
-                            let mut sender = sender.write().await;
+                            let mut sender = sender.lock().await;
                             send(&mut sender, ChannelMsg::Transactions { data: vec![transaction] }).await;
                         }
                     }
@@ -146,7 +146,7 @@ async fn handle_incoming(msg: &WsMessage, client: &mut client::WsClient) {
                 info!("Successfully unsubscribed from {} channel", params.channel)
             }
         },
-    };
+    }
 }
 
 /// Sends a message by serializing the message and sending it to the websocket.
@@ -217,7 +217,7 @@ pub mod client {
 
     impl std::str::FromStr for Channel {
         type Err = String;
-        
+
         fn from_str(s: &str) -> Result<Self, Self::Err> {
             match s {
                 "heartbeat" => Ok(Self::Heartbeat),
