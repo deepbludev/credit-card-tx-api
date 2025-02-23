@@ -19,7 +19,6 @@ use tracing::{error, info};
 ///
 /// This function upgrades the websocket connection and handles the incoming
 /// messages.
-///
 pub async fn endpoint(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle(socket, state))
 }
@@ -30,7 +29,6 @@ pub async fn endpoint(ws: WebSocketUpgrade, State(state): State<AppState>) -> im
 /// creates a channel for messages between the websocket and the server.
 ///
 /// It then spawns two tasks to handle the reading and writing of messages.
-///
 async fn handle(socket: WebSocket, state: AppState) {
     let (sender, receiver) = socket.split();
 
@@ -63,14 +61,8 @@ async fn handle(socket: WebSocket, state: AppState) {
 
 /// Read side of the websocket connection.
 ///
-/// This function reads messages from the websocket and sends them to the server
-/// in a loop using the given mpsc channel sender.
-///
-/// # Arguments
-///
-/// * `ws_stream` - The websocket stream to read messages from.
-/// * `ws_tx` - The mpsc channel sender to send messages to the server.
-///
+/// This function reads messages from the websocket and handles
+/// the received messages.
 async fn read(mut receiver: SplitStream<WebSocket>, client: Arc<RwLock<client::WsClient>>) {
     while let Some(Ok(msg)) = receiver.next().await {
         if let Message::Text(text) = msg {
@@ -87,15 +79,8 @@ async fn read(mut receiver: SplitStream<WebSocket>, client: Arc<RwLock<client::W
 
 /// Write side of the websocket connection.
 ///
-/// This function handles the writing of messages to the websocket. It also
-/// sends transactions from the transactions channel to the websocket.
-///
-/// # Arguments
-///
-/// * `ws_sink` - The websocket sink to write messages to.
-/// * `ws_rx` - The mpsc channel receiver to receive messages from the websocket.
-/// * `state` - The application state to get the channel senders from.
-///
+/// This function handles the writing of messages to the websocket. It streams
+/// the data for each of the client's subscribed channels.
 async fn write(
     sender: Arc<RwLock<SplitSink<WebSocket, Message>>>,
     client: Arc<RwLock<client::WsClient>>,
@@ -141,7 +126,6 @@ async fn write(
 ///
 /// This function handles the incoming messages from the websocket and
 /// returns the appropriate response.
-///
 async fn handle_incoming(msg: &WsMessage, client: &mut client::WsClient) {
     // handle the incoming message
     match msg {
@@ -166,12 +150,6 @@ async fn handle_incoming(msg: &WsMessage, client: &mut client::WsClient) {
 }
 
 /// Sends a message by serializing the message and sending it to the websocket.
-///
-/// # Arguments
-///
-/// * `msg` - The message to send to the websocket.
-/// * `sender` - The websocket sender to send the message to.
-///
 async fn send(tx: &mut SplitSink<WebSocket, Message>, msg: ChannelMsg) {
     if let Ok(serialized) = serde_json::to_string(&msg) {
         match tx.send(Message::Text(serialized.into())).await {
@@ -185,7 +163,6 @@ async fn send(tx: &mut SplitSink<WebSocket, Message>, msg: ChannelMsg) {
 ///
 /// This module includes the message types for the websocket API such as
 /// subscribe, unsubscribe, and heartbeat messages.
-///
 mod models {
     use crate::domain::prelude::*;
     use serde::{Deserialize, Serialize};
@@ -240,7 +217,7 @@ pub mod client {
 
     impl std::str::FromStr for Channel {
         type Err = String;
-
+        
         fn from_str(s: &str) -> Result<Self, Self::Err> {
             match s {
                 "heartbeat" => Ok(Self::Heartbeat),
@@ -254,7 +231,6 @@ pub mod client {
     ///
     /// This struct handles the subscription and unsubscription to channels
     /// for a given websocket connection.
-    ///
     #[derive(Debug, Default)]
     pub struct WsClient {
         pub channels: HashSet<Channel>,
@@ -262,20 +238,12 @@ pub mod client {
 
     impl WsClient {
         /// Subscribes to a websocket channel.
-        ///
-        /// This functions updates the list of subscribed channels and the receiver
-        /// for the transactions channel.
-        ///
         pub fn subscribe(&mut self, channel: Channel) -> &Self {
             self.channels.insert(channel.clone());
             self
         }
 
         /// Unsubscribes from a websocket channel.
-        ///
-        /// This functions updates the list of subscribed channels and the receiver
-        /// for the transactions channel.
-        ///
         pub fn unsubscribe(&mut self, channel: Channel) -> &Self {
             self.channels.remove(&channel);
             self
